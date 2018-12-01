@@ -1,0 +1,6 @@
+*.swp
+*.swo
+cscope.*
+*egg-info
+.DS_Store
+build
