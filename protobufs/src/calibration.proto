@@ -1,0 +1,14 @@
+syntax = "proto2";
+
+package calibration;
+
+message CalDistance {
+  optional float completionTimestamp = 1;
+  optional float miles = 2;
+  optional float duration = 3;
+  optional float revolutions = 4;
+}
+
+message Calibration {
+  optional CalDistance calDistance = 1;
+}

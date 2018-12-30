@@ -1,78 +1,81 @@
 import time
+import datetime
 import threading
 import thread
 import sys
 import collections
 import random
+import os
+
+sys.path.append('protobufs/build/python')
+
+import calibration_pb2
 
 #constants
 _pulesPerRev = 200.0;
 _debug = False
-_debug = True
+#_debug = True
 
 class PulseShim(threading.Thread):
+    PulsesPerRev = 200.0;
+    CalFile = "/tmp/treadknow.cal"
     def __init__(self, name):
+        self.Calibration = calibration_pb2.Calibration()
         #setup the windowing
-        self._lock = threading.Lock()
-        self._firstSampleTime = 0
-        self._lastSampleTime = 0
+        self.lock = threading.Lock()
+        self.prevSampleTime = 0
+        self.prevNumPulses = 0
         #delay between increments
-        self._numberOfPulses = 0
+        self.numPulses = 0
         self.shimUpdateRPMs(10.0)
-        self._nextSleepUntilTime = 0
+        self.nextSleepUntilTime = 0
         self.calMiles = None;
-        self.calTime = None;
+        self.calDurationSec = None;
         self.calRevolutions = None;
-        self.calRevToMilesScale = None;
+        self.calRevToMilesScale = 0.0;
         super(PulseShim, self).__init__()
 
     def run(self):
-        while self._shimIncrementDelay != 0:
+        self.nextSleepUntilTime = time.time() + self.shimIncrementDelay
+        while self.shimIncrementDelay != 0:
             curTime = time.time()
-            if self._nextSleepUntilTime == 0:
-                self._nextSleepUntilTime = curTime + self._shimIncrementDelay
-            delayTime = self._nextSleepUntilTime - curTime
+            delayTime = self.nextSleepUntilTime - curTime
             if _debug:
                 print "curTime", curTime
-                print "self._shimIncrementDelay", (self._shimIncrementDelay)
-                print "_nextSleepUntilTime", self._nextSleepUntilTime
+                print "self.shimIncrementDelay", (self.shimIncrementDelay)
+                print "_nextSleepUntilTime", self.nextSleepUntilTime
                 print "delayTime", delayTime
                 print ""
             if (delayTime>0):
                 time.sleep(delayTime)
             curTime = time.time()
-            self._nextSleepUntilTime = curTime + self._shimIncrementDelay
-            self._lock.acquire()
-            self._lastSampleTime = curTime
-            if self._firstSampleTime == 0:
-                self._firstSampleTime = curTime
-            else:
-                self._numberOfPulses += 1
-            self._lock.release()
+            self.nextSleepUntilTime = curTime + self.shimIncrementDelay
+            self.lock.acquire()
+            self.numPulses += 1
+            self.lock.release()
 
     def shimUpdateRPMs(self, RPMs):
         if RPMs == 0:
-            self._shimIncrementDelay = 0
+            self.shimIncrementDelay = 0
         else:
-            self._shimRPMs = float(RPMs);
-            self._shimRPS = self._shimRPMs/60.0
-            self._shimIncrementDelay = (1.0/_pulesPerRev)/self._shimRPS
+            self.shimRPMs = float(RPMs);
+            self.shimRPS = self.shimRPMs/60.0
+            self.shimIncrementDelay = (1.0/PulseShim.PulsesPerRev)/self.shimRPS
 
     def getTimedRevolutions(self):
-        self._lock.acquire()
-        totalTime = self._lastSampleTime - self._firstSampleTime
-        if totalTime == 0:
-            self._lock.release()
-            return (None, None)
-        numberOfPulses = self._numberOfPulses
-        self._firstSampleTime = 0
-        self._numberOfPulses = 0
-        self._lastSampleTime = 0
-        self._lock.release()
-        revolutions = numberOfPulses/_pulesPerRev
+        self.lock.acquire()
+        curTime = time.time()
+        totalTime = curTime - self.prevSampleTime
+        self.prevSampleTime = curTime
+        curPulses = self.numPulses - self.prevNumPulses
+        self.prevNumPulses = curPulses
+        self.lock.release()
+        revolutions = curPulses/PulseShim.PulsesPerRev
         if _debug:
-            print "numberOfPulses", numberOfPulses
+            print "curPulses", curPulses
             print "revolutions", revolutions 
+            print "totalTime", totalTime 
+            print ""
         return revolutions, totalTime
 
     def getRPMs(self):
@@ -86,20 +89,66 @@ class PulseShim(threading.Thread):
         revolutions, totalTime = self.getTimedRevolutions()
         return revolutions * self.calRevToMilesScale
 
+    def getCalibrationData(self):
+        calString = None
+        if os.path.exists(PulseShim.CalFile):
+            with open(PulseShim.CalFile, 'rb') as f:
+                try:
+                    calString = f.read()
+                    self.Calibration.ParseFromString(calString)
+                    if self.Calibration.HasField('calDistance'):
+                        print "Found calibration"
+                    else:
+                        calString = None
+                except IOError:
+                    print "Could not read cal file."
+
+        return calString
+
+    def updateCalibrationData(self):
+        calString = self.Calibration.SerializeToString()
+        with open(PulseShim.CalFile, 'wb') as f:
+            try:
+                f.write(calString)
+                print "Updated calibration data"
+                print self.Calibration
+            except IOError:
+                print "Could write cal file."
+
     def calibrate(self, MPH, timeSec):
-        self._lock.acquire()
-        self._firstSampleTime = 0
-        self._numberOfPulses = 0
-        self._lastSampleTime = 0
-        self._lock.release()
-        time.sleep(timeSec)
-        revolutions, totalTime = self.getTimedRevolutions()
-        self.calTime = timeSec
-        self.calRevolutions  = revolutions
-        self.calMiles = (MPH/60.0)*(timeSec/60.0)
+        # ignore the getDistance call, just to get a sample and zero everything out
+        # because we are ignoring this means that we have the assumption that the app
+        # is not running in an other state other than calibrate (which should be safe)
+        calString = self.getCalibrationData()
+
+        if calString is not None:
+            print "Using previous cal"
+            print self.Calibration
+            self.calDurationSec = self.Calibration.calDistance.duration
+            self.calRevolutions = self.Calibration.calDistance.revolutions
+            self.calMiles       = self.Calibration.calDistance.miles
+        else:
+            print "Updating calibration"
+            self.getDistance()
+            time.sleep(timeSec)
+            revolutions, totalTime = self.getTimedRevolutions()
+            calDistance = calibration_pb2.CalDistance()
+            self.calDurationSec = totalTime
+            self.calRevolutions  = revolutions
+            self.calMiles = (MPH/60.0)*(self.calDurationSec/60.0)
+            calDistance.completionTimestamp = time.time()
+            calDistance.miles = self.calMiles
+            calDistance.revolutions = self.calRevolutions
+            calDistance.duration = totalTime
+            self.Calibration.calDistance.CopyFrom(calDistance)
+            self.updateCalibrationData()
+
         self.calRevToMilesScale = self.calMiles/self.calRevolutions
+        
+        # Write the new address book back to disk.
+
         if _debug:
-            print "self.calTime", self.calTime
+            print "self.calDurationSec", self.calDurationSec
             print "self.calRevolutions", self.calRevolutions
             print "self.calMiles", self.calMiles
             print "self.calRevToMilesScale", self.calRevToMilesScale
@@ -126,7 +175,7 @@ if __name__ == '__main__':
     finally:
         t.shimUpdateRPMs(0)
 
-        print "self.calTime", t.calTime
+        print "self.calDurationSec", t.calDurationSec
         print "self.calRevolutions", t.calRevolutions
         print "self.calMiles", t.calMiles
         print "self.calRevToMilesScale", t.calRevToMilesScale
